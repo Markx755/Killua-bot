@@ -1,0 +1,74 @@
+# ---- dependencies ----
+node_modules/
+jspm_packages/
+.pnp/
+.pnp.js
+.yarn/cache/
+.yarn/unplugged/
+.yarn/install-state.gz
+
+# ---- build output ----
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# ---- secrets & environment (never commit) ----
+.env
+.env.*
+!.env.preset
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+.secrets
+credentials.json
+serviceaccount*.json
+*.token
+
+# ---- database ----
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+/database/
+
+# ---- logs ----
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pm2/
+
+# ---- test / coverage ----
+coverage/
+.nyc_output/
+test-results/
+junit.xml
+
+# ---- cache ----
+.npm/
+.cache/
+.eslintcache
+.parcel-cache/
+.rollup.cache/
+.turbo/
+.nx/
+.ts-node/
+
+# ---- editor / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
