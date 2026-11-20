@@ -1,433 +1,512 @@
-import dotenv from 'dotenv';
-import {logger} from './logger';
 import {
+	ChannelType,
 	Client,
-	InteractionType,
 	GatewayIntentBits,
+	Guild,
 	Interaction,
+	InteractionType,
+	PermissionsBitField,
 	VoiceState,
-	ChannelType} from 'discord.js';
-import {initSequelize} from './database/dbmanager';
-import srcCommands from './slashCommands/_commands';
+} from 'discord.js';
+import dotenv from 'dotenv';
+import {Sequelize} from 'sequelize-typescript';
+
+import {AppConfig, loadConfig} from './config';
+import {
+	closeDatabase,
+	connectDatabase,
+	createSequelize,
+} from './database/dbmanager';
 import DynamicVoiceChannel from './database/models/dynamic_voice_channel.model';
 import ServerSetting from './database/models/server_setting.model';
+import {logError, logger} from './logger';
+import srcCommands from './slashCommands/_commands';
 
 dotenv.config();
 
+const {ViewChannel} = PermissionsBitField.Flags;
 
-const client = new Client({
-	intents:
-		[
-			GatewayIntentBits.Guilds,
-			GatewayIntentBits.GuildMembers,
-			GatewayIntentBits.GuildVoiceStates,
-		],
+/**
+ * Resources created while provisioning a dynamic channel. Tracked as they are
+ * created so a failure half-way through can be rolled back; the previous code
+ * only cleaned up from the database row, which did not exist yet when role or
+ * channel creation failed, leaving orphaned roles and channels behind.
+ */
+interface ProvisionedResources {
+	roleIds: string[];
+	channelIds: string[];
+}
+
+const newTracker = (): ProvisionedResources => ({roleIds: [], channelIds: []});
+
+const rollbackResources = async (
+	guild: Guild,
+	created: ProvisionedResources,
+): Promise<void> => {
+	const channelFailure = 'Dynamic channel provisioning rollback failed';
+
+	for (const channelId of [...created.channelIds].reverse()) {
+		try {
+			const channel = await guild.channels.fetch(channelId);
+			if (channel) await channel.delete('Rollback of failed channel creation');
+		} catch (err) {
+			logError(`${channelFailure} (channel ${channelId})`, err);
+		}
+	}
+	for (const roleId of [...created.roleIds].reverse()) {
+		try {
+			const role = await guild.roles.fetch(roleId);
+			if (role) await role.delete('Rollback of failed channel creation');
+		} catch (err) {
+			logError(`${channelFailure} (role ${roleId})`, err);
+		}
+	}
+};
+
+const createClient = (): Client => new Client({
+	intents: [
+		GatewayIntentBits.Guilds,
+		GatewayIntentBits.GuildMembers,
+		GatewayIntentBits.GuildVoiceStates,
+	],
 });
 
-const sequelize = initSequelize();
-
-client.on('ready', async () => {
-	logger.info('Connecting to the database...');
-	try {
-		await sequelize.authenticate();
-		logger.info('Database connection established!');
-	} catch (err) {
-		logger.error(err);
-		logger.error(err.stack);
-		process.exit(1);
+/**
+ * Registers the slash command tree and removes commands that no longer exist
+ * in source. Awaited sequentially: the previous `forEach(async ...)` version
+ * returned before any API call resolved, so startup reported success while
+ * registration was still in flight (and any rejection was unhandled).
+ */
+const syncApplicationCommands = async (client: Client): Promise<void> => {
+	if (!client.application) {
+		throw new Error('Discord application is not available before login.');
 	}
 
-	logger.info('Sync database models via sequelize (safe sync)...');
-	sequelize.sync();
-	logger.info('Sync successfull!');
-
-	logger.info('Updating command registry via discord API...');
+	logger.info('Updating command registry via Discord API...');
 	const appCommands = await client.application.commands.fetch();
-	appCommands.forEach(async (appCommand) => {
-		const srcCommand = srcCommands.find(
-			(srcCommand) => appCommand.name === srcCommand.commandData.name,
-		);
 
+	for (const appCommand of appCommands.values()) {
+		const srcCommand = srcCommands.find(
+			(src) => src.commandData.name === appCommand.name,
+		);
 		if (!srcCommand) {
 			logger.debug(
-				`APP ${appCommand.name} is ${appCommand.id} -> not found anymore in ` +
-				`source -> deleting -> ✅`);
-
+				`APP ${appCommand.name} is ${appCommand.id} -> no longer in source ` +
+				'-> deleting',
+			);
 			await appCommand.delete();
 		}
-	});
-	srcCommands.forEach(async (srcCommand) => {
+	}
+
+	for (const srcCommand of srcCommands) {
 		const appCommand = appCommands.find(
-			(appCommand) => appCommand.name === srcCommand.commandData.name);
-		if (appCommand) {
-			if (appCommand.equals(srcCommand.commandData)) {
-				logger.debug(
-					`SRC ${srcCommand.commandData.name} is ${appCommand.id} -> no ` +
-					`changes needed -> ✅`);
-			} else {
-				logger.debug(
-					`SRC ${srcCommand.commandData.name} is ${appCommand.id} -> ` +
-					`Re-Syncing -> ✅`);
-				await appCommand.edit(srcCommand.commandData);
-			}
-		} else {
+			(app) => app.name === srcCommand.commandData.name,
+		);
+		if (!appCommand) {
 			logger.debug(
-				`SRC ${srcCommand.commandData.name} is nonexistant -> Creating -> ✅`);
+				`SRC ${srcCommand.commandData.name} is nonexistent -> creating`,
+			);
 			await client.application.commands.create(srcCommand.commandData);
+			continue;
+		}
+		if (appCommand.equals(srcCommand.commandData)) {
+			logger.debug(
+				`SRC ${srcCommand.commandData.name} is ${appCommand.id} -> ` +
+				'no changes needed',
+			);
+			continue;
+		}
+		logger.debug(
+			`SRC ${srcCommand.commandData.name} is ${appCommand.id} -> re-syncing`,
+		);
+		await appCommand.edit(srcCommand.commandData);
+	}
+
+	logger.info('Command registry updated successfully.');
+};
+
+const createDynamicChannel = async (
+	state: VoiceState,
+	isPrivate: boolean,
+): Promise<void> => {
+	const member = state.member;
+	const guild = state.guild;
+	if (!member) {
+		logError('createDynamicChannel', new Error('Voice state has no member'));
+		return;
+	}
+
+	const label = isPrivate ? 'Private' : 'Public';
+	const channelName = `${label} by ${member.user.username}`;
+	const botMember = guild.members.me;
+	if (!botMember) {
+		logError(
+			'createDynamicChannel',
+			new Error('Bot member is not resolvable in this guild'),
+		);
+		return;
+	}
+
+	const created = newTracker();
+	let record: DynamicVoiceChannel | undefined;
+
+	try {
+		const role = await guild.roles.create({
+			name: channelName,
+			mentionable: false,
+		});
+		created.roleIds.push(role.id);
+
+		const voiceChannel = await guild.channels.create({
+			name: channelName,
+			parent: state.channel?.parent ?? null,
+			type: ChannelType.GuildVoice,
+		});
+		created.channelIds.push(voiceChannel.id);
+
+		await voiceChannel.lockPermissions();
+		await voiceChannel.permissionOverwrites.edit(botMember, {
+			ViewChannel: true,
+		});
+		if (isPrivate) {
+			await voiceChannel.permissionOverwrites.edit(guild.roles.everyone, {
+				ViewChannel: false,
+			});
+			await voiceChannel.permissionOverwrites.edit(role, {
+				ViewChannel: true,
+			});
+		}
+
+		const textChannel = await guild.channels.create({
+			name: channelName,
+			parent: state.channel?.parent ?? null,
+			type: ChannelType.GuildText,
+		});
+		created.channelIds.push(textChannel.id);
+
+		await textChannel.lockPermissions();
+		await textChannel.permissionOverwrites.edit(botMember, {
+			ViewChannel: true,
+		});
+		await textChannel.permissionOverwrites.edit(guild.roles.everyone, {
+			ViewChannel: false,
+		});
+		await textChannel.permissionOverwrites.edit(role, {
+			ViewChannel: true,
+		});
+
+		record = await DynamicVoiceChannel.create({
+			guild_snowflake: guild.id,
+			voice_channel_snowflake: voiceChannel.id,
+			text_channel_snowflake: textChannel.id,
+			positive_accessrole_snowflake: role.id,
+			owner_member_snowflake: member.id,
+			is_channel_private: isPrivate,
+			is_channel_renamed: false,
+			last_edit: new Date(Date.now() - 600000),
+			should_archive: false,
+			inviteall_activated: false,
+		});
+
+		await member.voice.setChannel(voiceChannel);
+		await member.roles.add(role);
+	} catch (err) {
+		logError(`Provisioning ${label.toLowerCase()} channel failed`, err);
+		await rollbackResources(guild, created);
+		if (record) {
+			try {
+				await record.destroy();
+			} catch (dbErr) {
+				logError('Failed to remove dangling channel record', dbErr);
+			}
+		}
+	}
+};
+
+const findDynamicChannelFor = async (
+	state: VoiceState,
+): Promise<DynamicVoiceChannel | null> => {
+	if (!state.channel) return null;
+	return DynamicVoiceChannel.findOne({
+		where: {
+			guild_snowflake: state.guild.id,
+			voice_channel_snowflake: state.channel.id,
+		},
+	});
+};
+
+const registerHandlers = (client: Client, sequelize: Sequelize): void => {
+	client.once('ready', async () => {
+		try {
+			await syncApplicationCommands(client);
+			logger.info(`Logged in as ${client.user?.tag ?? 'unknown user'}`);
+		} catch (err) {
+			logError('Initialisation after login failed', err);
+			await shutdown(client, sequelize, 1);
 		}
 	});
-	logger.info('Command registry updated successfully!');
 
-	logger.info(`Logged in as ${client.user.tag}`);
-});
+	client.on('interactionCreate', async (interaction: Interaction) => {
+		if (interaction.type !== InteractionType.ApplicationCommand) return;
+		if (!interaction.isChatInputCommand()) return;
 
-client.on('interactionCreate', async (interaction: Interaction) => {
-	if (interaction.type !== InteractionType.ApplicationCommand) return;
-
-	const command = srcCommands.find(
-		(el) => el.commandData.name === interaction.commandName);
-
-	await command?.commandExecutor(interaction);
-});
-
-client.on('dynamicChannelJoin', async (
-	state: VoiceState,
-	dynamicChannel: DynamicVoiceChannel,
-) => {
-	try {
-		await state.member.roles.add(
-			await state.guild.roles.fetch(
-				dynamicChannel.positive_accessrole_snowflake,
-			),
+		const command = srcCommands.find(
+			(src) => src.commandData.name === interaction.commandName,
 		);
-	} catch (err) {
-		logger.warn(err);
-		logger.warn(err.stack);
-	}
-});
-
-const createPublicDynamicChannel = async (state: VoiceState) => {
-	const channelParent = state?.channel?.parent;
-	let newDynamicChannel;
-	try {
-		// The new role for this dynamic channel
-		const newrole = await state.guild.roles.create({
-			name: `Public by ${state.member.user.username}`,
-			mentionable: false,
-		});
-
-		// The new voice channel
-		const newvc = await state.guild.channels.create({
-			name: `Public by ${state.member.user.username}`,
-			parent: channelParent,
-			type: ChannelType.GuildVoice,
-		});
-		await newvc.lockPermissions();
-		await newvc.permissionOverwrites.edit(
-			client.user,
-			{
-				ViewChannel: true,
-			},
-		);
-
-		const newtc = await state.guild.channels.create({
-			name: `Public by ${state.member.user.username}`,
-			parent: channelParent,
-			type: ChannelType.GuildText,
-		});
-		await newtc.lockPermissions();
-		await newtc.permissionOverwrites.edit(
-			client.user,
-			{
-				ViewChannel: true,
-			},
-		);
-		await newtc.permissionOverwrites.edit(
-			state.guild.roles.everyone,
-			{
-				ViewChannel: false,
-			},
-		);
-		await newtc.permissionOverwrites.edit(
-			newrole,
-			{
-				ViewChannel: true,
-			},
-		);
-
-		newDynamicChannel = await DynamicVoiceChannel.create({
-			guild_snowflake: state.guild.id,
-			voice_channel_snowflake: newvc.id,
-			text_channel_snowflake: newtc.id,
-			positive_accessrole_snowflake: newrole.id,
-			owner_member_snowflake: state.member.id,
-			is_channel_private: false,
-			is_channel_renamed: false,
-			last_edit: Date.now() - 600000,
-			should_archive: false,
-		});
-		await state.member.voice.setChannel(newvc);
-		await state.member.roles.add(newrole);
-	} catch (err) {
-		logger.error(err);
-		logger.error(err.stack);
-		try {
-			// Need to safely delete the channels and
-			// role when creating or moving fails
-			await (await state.guild.roles.fetch(
-				newDynamicChannel.positive_accessrole_snowflake)).delete();
-			await (await state.guild.channels.fetch(
-				newDynamicChannel.text_channel_snowflake)).delete();
-			await (await state.guild.channels.fetch(
-				newDynamicChannel.voice_channel_snowflake)).delete();
-		} catch (err) {
-			logger.warn(err);
-			logger.warn(err.stack);
+		if (!command) {
+			logger.warn(`No handler registered for /${interaction.commandName}`);
+			return;
 		}
-	}
-};
 
-const createPrivateDynamicChannel = async (state: VoiceState) => {
-	const channelParent = state?.channel?.parent;
-	let newDynamicChannel;
-	try {
-		// The new role for this dynamic channel
-		const newrole = await state.guild.roles.create({
-			name: `Private by ${state.member.user.username}`,
-			mentionable: false,
-		});
-
-		// The new voice channel, it is only visible with
-		// the role you get with an invite
-		const newvc = await state.guild.channels.create({
-			name: `Private by ${state.member.user.username}`,
-			type: ChannelType.GuildVoice,
-			parent: channelParent,
-		});
-		await newvc.lockPermissions();
-		await newvc.permissionOverwrites.edit(
-			client.user,
-			{
-				ViewChannel: true,
-			},
-		);
-		await newvc.permissionOverwrites.edit(
-			state.guild.roles.everyone,
-			{
-				ViewChannel: false,
-			},
-		);
-		await newvc.permissionOverwrites.edit(
-			newrole,
-			{
-				ViewChannel: true,
-			},
-		);
-
-		// The new text channel, it is only visible with
-		// the role you get with an invite
-		const newtc = await state.guild.channels.create({
-			name: `Private by ${state.member.user.username}`,
-			type: ChannelType.GuildText,
-			parent: channelParent,
-		});
-		await newtc.lockPermissions();
-		await newtc.permissionOverwrites.edit(
-			client.user,
-			{
-				ViewChannel: true,
-			},
-		);
-		await newtc.permissionOverwrites.edit(
-			state.guild.roles.everyone,
-			{
-				ViewChannel: false,
-			},
-		);
-		await newtc.permissionOverwrites.edit(
-			newrole,
-			{
-				ViewChannel: true,
-			},
-		);
-
-		newDynamicChannel = await DynamicVoiceChannel.create({
-			guild_snowflake: state.guild.id,
-			voice_channel_snowflake: newvc.id,
-			text_channel_snowflake: newtc.id,
-			positive_accessrole_snowflake: newrole.id,
-			owner_member_snowflake: state.member.id,
-			is_channel_private: true,
-			is_channel_renamed: false,
-			last_edit: Date.now() - 600000,
-			should_archive: false,
-		});
-
-		await state.member.voice.setChannel(newvc);
-		await state.member.roles.add(newrole);
-	} catch (err) {
-		logger.error(err);
-		logger.error(err.stack);
 		try {
-			// Need to safely delete the channels and
-			// role when creating or moving fails
-			await (await state.guild.roles.fetch(
-				newDynamicChannel.positive_accessrole_snowflake)).delete();
-			await (await state.guild.channels.fetch(
-				newDynamicChannel.text_channel_snowflake)).delete();
-			await (await state.guild.channels.fetch(
-				newDynamicChannel.voice_channel_snowflake)).delete();
+			await command.commandExecutor(interaction);
 		} catch (err) {
-			logger.warn(err);
-			logger.warn(err.stack);
-		}
-	}
-};
-
-
-/**
- * Custom Event: voiceChannelJoin
- * When a user joins any voice channel
- */
-client.on('voiceChannelJoin', async (
-	state: VoiceState,
-	dynamicChannel?: DynamicVoiceChannel,
-) => {
-	if (dynamicChannel) {
-		client.emit('dynamicChannelJoin', state, dynamicChannel);
-		return;
-	}
-
-	// If new channel is "Create public channel", create a
-	// channel and role and move the user
-	if (state.channel?.id === (await ServerSetting.findOne({
-		where: {
-			guild_snowflake: state.guild.id,
-			setting_name: 'NEW_PUBLIC_VOICECHANNEL',
-		},
-	}))?.setting_value
-	) {
-		createPublicDynamicChannel(state);
-		return;
-	}
-
-	// If new channel is "Create private channel",
-	// create a channel and role and move the user
-	if (state.channel?.id === (await ServerSetting.findOne({
-		where: {
-			guild_snowflake: state.guild.id,
-			setting_name: 'NEW_PRIVATE_VOICECHANNEL',
-		},
-	}))?.setting_value
-	) {
-		createPrivateDynamicChannel(state);
-		return;
-	}
-});
-
-/**
- * Custom Event: dynamicChannelLeave
- * When a user leaves a dynamic channel
- */
-client.on('dynamicChannelLeave', async (
-	state: VoiceState,
-	dynamicChannel: DynamicVoiceChannel,
-) => {
-	// If old channel was public dynamic, remove the role from user;
-	if (!dynamicChannel.is_channel_private) {
-		try {
-			await state.member.roles.remove(
-				await state.guild.roles.fetch(
-					dynamicChannel.positive_accessrole_snowflake,
-				),
-			);
-		} catch (err) {
-			logger.warn(err);
-			logger.warn(err.stack);
-		}
-	}
-
-	// If old channel is now empty, delete everything
-	if (state.channel?.members?.size < 1) {
-		try {
-			await (await state.guild.roles.fetch(
-				dynamicChannel.positive_accessrole_snowflake)
-			).delete('Corresponding voice channel is empty');
-
-			if (dynamicChannel.should_archive) {
-				const textChannel = await state.guild.channels.fetch(
-					dynamicChannel.text_channel_snowflake);
-				await textChannel.edit({
-					name: `archived-by-${(await state.guild.members.fetch(
-						dynamicChannel.owner_member_snowflake)).user.username}`,
-					permissionOverwrites: [
-						{id: state.guild.roles.everyone, deny: ['ViewChannel']},
-						{id: await state.guild.members.fetch(
-							dynamicChannel.owner_member_snowflake),
-						allow: ['ViewChannel']}],
-				});
-			} else {
-				await (await state.guild.channels.fetch(
-					dynamicChannel.text_channel_snowflake)).delete(
-					'Corresponding voice channel is empty');
+			logError(`Handler for /${interaction.commandName} threw`, err);
+			try {
+				if (interaction.deferred || interaction.replied) {
+					await interaction.editReply({
+						content: 'เกิดข้อผิดพลาดภายในระบบ กรุณาลองใหม่อีกครั้ง',
+					});
+				} else {
+					await interaction.reply({
+						content: 'เกิดข้อผิดพลาดภายในระบบ กรุณาลองใหม่อีกครั้ง',
+						ephemeral: true,
+					});
+				}
+			} catch (replyErr) {
+				logError('Failed to report handler failure', replyErr);
 			}
-			await state.channel.delete('This voice channel is empty');
+		}
+	});
 
+	client.on('dynamicChannelJoin', async (
+		state: VoiceState,
+		dynamicChannel: DynamicVoiceChannel,
+	) => {
+		const member = state.member;
+		if (!member) return;
+		try {
+			const role = await state.guild.roles.fetch(
+				dynamicChannel.positive_accessrole_snowflake,
+			);
+			if (!role) {
+				logger.warn(
+					`Access role ${dynamicChannel.positive_accessrole_snowflake} is gone`,
+				);
+				return;
+			}
+			await member.roles.add(role);
+		} catch (err) {
+			logError('Failed to grant dynamic channel access role', err);
+		}
+	});
+
+	client.on('voiceChannelJoin', async (
+		state: VoiceState,
+		dynamicChannel: DynamicVoiceChannel | null,
+	) => {
+		try {
+			if (dynamicChannel) {
+				client.emit('dynamicChannelJoin', state, dynamicChannel);
+				return;
+			}
+
+			if (!state.channel) return;
+
+			const publicSetting = await ServerSetting.findOne({
+				where: {
+					guild_snowflake: state.guild.id,
+					setting_name: 'NEW_PUBLIC_VOICECHANNEL',
+				},
+			});
+			if (publicSetting && state.channel.id === publicSetting.setting_value) {
+				await createDynamicChannel(state, false);
+				return;
+			}
+
+			const privateSetting = await ServerSetting.findOne({
+				where: {
+					guild_snowflake: state.guild.id,
+					setting_name: 'NEW_PRIVATE_VOICECHANNEL',
+				},
+			});
+			if (privateSetting && state.channel.id === privateSetting.setting_value) {
+				await createDynamicChannel(state, true);
+			}
+		} catch (err) {
+			logError('voiceChannelJoin handler failed', err);
+		}
+	});
+
+	client.on('dynamicChannelLeave', async (
+		state: VoiceState,
+		dynamicChannel: DynamicVoiceChannel,
+	) => {
+		const member = state.member;
+		try {
+			if (!dynamicChannel.is_channel_private && member) {
+				const role = await state.guild.roles.fetch(
+					dynamicChannel.positive_accessrole_snowflake,
+				);
+				if (role) await member.roles.remove(role);
+			}
+		} catch (err) {
+			logError('Failed to remove access role on leave', err);
+		}
+
+		try {
+			const voiceChannel = state.channel;
+			if (!voiceChannel) return;
+			if (voiceChannel.members.size > 0) return;
+
+			const role = await state.guild.roles.fetch(
+				dynamicChannel.positive_accessrole_snowflake,
+			);
+			if (role) await role.delete('Corresponding voice channel is empty');
+
+			const textChannel = await state.guild.channels.fetch(
+				dynamicChannel.text_channel_snowflake,
+			);
+
+			if (dynamicChannel.should_archive && textChannel) {
+				const owner = await state.guild.members.fetch(
+					dynamicChannel.owner_member_snowflake,
+				);
+				await textChannel.edit({
+					name: `archived-by-${owner.user.username}`,
+					permissionOverwrites: [
+						{
+							id: state.guild.roles.everyone.id,
+							deny: [ViewChannel],
+						},
+						{id: owner.id, allow: [ViewChannel]},
+					],
+				});
+			} else if (textChannel) {
+				await textChannel.delete('Corresponding voice channel is empty');
+			}
+
+			await voiceChannel.delete('This voice channel is empty');
 			await dynamicChannel.destroy();
 		} catch (err) {
-			logger.warn(err);
-			logger.warn(err.stack);
+			logError('Failed to tear down empty dynamic channel', err);
 		}
+	});
+
+	client.on('voiceChannelLeave', (
+		state: VoiceState,
+		dynamicChannel: DynamicVoiceChannel | null,
+	) => {
+		if (dynamicChannel) {
+			client.emit('dynamicChannelLeave', state, dynamicChannel);
+		}
+	});
+
+	client.on('voiceChannelChange', async (
+		oldState: VoiceState,
+		newState: VoiceState,
+	) => {
+		try {
+			const oldDynamicChannel = await findDynamicChannelFor(oldState);
+			if (oldState.channel) {
+				client.emit('voiceChannelLeave', oldState, oldDynamicChannel);
+			}
+
+			const newDynamicChannel = await findDynamicChannelFor(newState);
+			if (newState.channel) {
+				client.emit('voiceChannelJoin', newState, newDynamicChannel);
+			}
+		} catch (err) {
+			logError('voiceChannelChange handler failed', err);
+		}
+	});
+
+	client.on('voiceStateUpdate', (oldState: VoiceState, newState: VoiceState) => {
+		// Compare identifiers, not object identity: discord.js hands out
+		// different channel instances per event, so `===` on the objects made
+		// mute/deafen updates look like channel moves.
+		if (oldState.channelId === newState.channelId) return;
+
+		logger.verbose(
+			`${newState.member?.user.username ?? 'unknown'} changed from ` +
+			`${oldState.channel?.name ?? 'none'} to ` +
+			`${newState.channel?.name ?? 'none'}`,
+		);
+
+		client.emit('voiceChannelChange', oldState, newState);
+	});
+};
+
+const shutdown = async (
+	client: Client,
+	sequelize: Sequelize,
+	code: number,
+): Promise<void> => {
+	try {
+		client.removeAllListeners();
+		await client.destroy();
+	} catch (err) {
+		logError('Failed to destroy the Discord client cleanly', err);
 	}
-});
+	await closeDatabase(sequelize);
+	process.exit(code);
+};
 
-/**
- * Custom Event: voiceChannelLeave
- * When a user leaves any voice channel.
- */
-client.on('voiceChannelLeave', async (
-	state: VoiceState,
-	dynamicChannel?: DynamicVoiceChannel,
-) => {
-	if (dynamicChannel) client.emit('dynamicChannelLeave', state, dynamicChannel);
-});
-
-/**
- * Custom Event: voiceChannelChange
- * When a user switches channel (oldState and newState channels are not equal,
- * but one of them can be null)
- */
-client.on('voiceChannelChange', async (oldState: VoiceState, newState) => {
-	const oldDynamicChannel = await DynamicVoiceChannel.findOne({where: {
-		guild_snowflake: oldState.guild.id,
-		voice_channel_snowflake: oldState.channel?.id ?? 'NULL',
-	}});
-	if (oldState.channel) {
-		client.emit('voiceChannelLeave', oldState, oldDynamicChannel);
+const main = async (): Promise<void> => {
+	let config: AppConfig;
+	try {
+		config = loadConfig();
+	} catch (err) {
+		// Configuration errors are fatal and must be visible on stderr even if
+		// the logger failed to initialise.
+		console.error(err instanceof Error ? err.message : String(err));
+		process.exit(1);
+		return;
 	}
 
-	const newDynamicChannel = await DynamicVoiceChannel.findOne({where: {
-		guild_snowflake: newState.guild.id,
-		voice_channel_snowflake: newState.channel?.id ?? 'NULL',
-	}});
-	if (newState.channel) {
-		client.emit('voiceChannelJoin', newState, newDynamicChannel);
+	let sequelize: Sequelize;
+	try {
+		sequelize = createSequelize(config.database);
+	} catch (err) {
+		logError('Database driver initialisation failed — aborting startup', err);
+		process.exit(1);
+		return;
 	}
-});
+	const client = createClient();
 
-/**
- * Standard Discord Event: voiceStateUpdate
- * When a user switches channel, mutes or deafens himself,
- * gets muted or deafened, etc.
- */
-client.on('voiceStateUpdate', async (oldState: VoiceState, newState) => {
-	if (oldState.channel === newState.channel) return;
+	process.on('unhandledRejection', (reason) => {
+		logError('Unhandled promise rejection', reason);
+	});
+	process.on('uncaughtException', (err) => {
+		logError('Uncaught exception', err);
+		void shutdown(client, sequelize, 1);
+	});
 
-	logger.verbose(
-		`${newState.member.user.username} changed from ${oldState.channel?.name} ` +
-		`to ${newState.channel?.name}`);
+	try {
+		// Fail fast: a bot that comes online without a schema serves errors.
+		await connectDatabase(sequelize);
+	} catch (err) {
+		logError('Database initialisation failed — aborting startup', err);
+		await closeDatabase(sequelize);
+		process.exit(1);
+		return;
+	}
 
-	client.emit('voiceChannelChange', oldState, newState);
-});
+	registerHandlers(client, sequelize);
 
-client.login(process.env.DD_DISCORD_BOT_TOKEN);
+	for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+		process.on(signal, () => {
+			logger.info(`Received ${signal}, shutting down...`);
+			void shutdown(client, sequelize, 0);
+		});
+	}
+
+	try {
+		await client.login(config.discordToken);
+	} catch (err) {
+		logError('Discord login failed', err);
+		await shutdown(client, sequelize, 1);
+	}
+};
+
+void main();
