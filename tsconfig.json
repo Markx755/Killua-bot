@@ -1,12 +1,15 @@
 {
 	"compilerOptions": {
 		"module": "commonjs",
+		"target": "ES2022",
+		"lib": ["ES2022"],
+		"moduleResolution": "node",
 		"esModuleInterop": true,
-		"target": "ES2020",
 		"experimentalDecorators": true,
 		"emitDecoratorMetadata": true,
 		"noImplicitAny": true,
-		"moduleResolution": "node",
+		"forceConsistentCasingInFileNames": true,
+		"skipLibCheck": true,
 		"sourceMap": false,
 		"outDir": "dist",
 		"baseUrl": ".",
@@ -17,9 +20,14 @@
 		}
 	},
 	"ts-node": {
-		"esm": true,
+		"esm": false
 	},
 	"include": [
-		"**/*.ts"
+		"src/**/*.ts"
+	],
+	"exclude": [
+		"node_modules",
+		"dist",
+		"**/*.test.ts"
 	]
 }
